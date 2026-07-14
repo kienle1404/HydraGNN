@@ -78,6 +78,7 @@ from hydragnn.utils.datasets.pickledataset import (
     SimplePickleWriter,
     SimplePickleDataset,
 )
+from fnet_window_dataset import splits_from_meta, window_anchors
 
 # ADIOS is optional; only required when --format adios is selected.
 try:
@@ -701,6 +702,25 @@ def _meta_path(cache_dir: Path, date: str) -> Path:
     return cache_dir / f"fnet_{date}_meta.pkl"
 
 
+def write_meta_only(cache_dir: Path, date: str, meta: dict):
+    """Cache for ``--dataset_mode ondemand``: only the shared arrays.
+
+    ``meta`` already carries X, observed_mask, grid_embed, edge_index and
+    edge_weight, which is everything ``FNETWindowDataset`` needs to build any
+    window. The per-window pickles written by ``write_cache`` are therefore pure
+    redundancy -- and they are what makes the cache scale with the window count
+    (~0.39 MB each, so ~26 GB at the stride-10 budget). Skipping them keeps the
+    cache at the size of the arrays (~1.6 GB) regardless of how many windows the
+    training run asks for.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with open(_meta_path(cache_dir, date), "wb") as f:
+        pickle.dump(meta, f)
+    size_gb = _meta_path(cache_dir, date).stat().st_size / 1024**3
+    print(f"[cache] on-demand metadata saved to {_meta_path(cache_dir, date)} ({size_gb:.2f} GB)")
+    print("[cache] no per-window pickles written (windows are built on the fly)")
+
+
 def write_cache(
     cache_dir: Path, date: str, fmt: str, trainset, valset, testset, predset, meta: dict
 ):
@@ -889,39 +909,6 @@ def preprocess_stage(args, cache_dir: Path):
         ("pred", pred_start, min(pred_start + n_pred, T)),
     ]
     out_idx = np.array(args.out_features, dtype=np.int64)
-    seg_data = {
-        name: make_window_dataset(
-            X[lo:hi],
-            grid_embed,
-            edge_index,
-            Tin=args.Tin,
-            H=args.horizon,
-            observed_mask=observed_mask[lo:hi],
-            out_idx=out_idx,
-            edge_weight=edge_weight,
-            predict_delta=bool(args.predict_delta),
-            max_windows=args.max_windows,
-        )
-        for name, lo, hi in seg_bounds
-    }
-    train_data, val_data, test_data, pred_data = (
-        seg_data["train"],
-        seg_data["val"],
-        seg_data["test"],
-        seg_data["pred"],
-    )
-    if args.predict_delta:
-        print("[ds]    target = delta from x_last (predict_delta=True)")
-    print(
-        f"[split] slice-then-window train/val/test/pred = "
-        f"{len(train_data)}/{len(val_data)}/{len(test_data)}/{len(pred_data)}  "
-        f"(Tin={args.Tin}, H={args.horizon}; no window crosses a boundary)"
-    )
-    if min(len(train_data), len(val_data), len(test_data)) < 1:
-        raise RuntimeError(
-            "A split produced 0 windows; each segment length must exceed Tin + H. "
-            "Reduce --Tin/--horizon, change split fractions, or use a longer day."
-        )
 
     meta = {
         "fdr_ids": fdr_ids,
@@ -948,7 +935,85 @@ def preprocess_stage(args, cache_dir: Path):
         "scaling": args.scaling,
         "out_idx": out_idx,
         "predict_delta": bool(args.predict_delta),
+        # Windowing policy is recorded so train_stage can rebuild the exact same
+        # segments/anchors in --dataset_mode ondemand without re-deriving them.
+        "train_frac": float(args.train_frac),
+        "val_frac": float(args.val_frac),
+        "test_frac": float(args.test_frac),
+        "pred_frac": float(args.pred_frac),
+        "window_stride": args.window_stride,
+        "max_windows": args.max_windows,
+        "dataset_mode": args.dataset_mode,
     }
+
+    if args.predict_delta:
+        print("[ds]    target = delta from x_last (predict_delta=True)")
+
+    if args.dataset_mode == "ondemand":
+        # Windows are never materialized; only the shared arrays are cached.
+        counts = {
+            name: len(
+                window_anchors(
+                    hi - lo, args.Tin, args.horizon,
+                    max_windows=args.max_windows, stride=args.window_stride,
+                )
+            )
+            for name, lo, hi in seg_bounds
+        }
+        sel = (
+            f"stride={args.window_stride}"
+            if args.window_stride
+            else f"max_windows={args.max_windows}"
+        )
+        cov = (
+            f"{100.0 * args.horizon / args.window_stride:.1f}%"
+            if args.window_stride
+            else "n/a"
+        )
+        print(
+            f"[split] on-demand train/val/test/pred = "
+            f"{counts['train']}/{counts['val']}/{counts['test']}/{counts['pred']}  "
+            f"({sel}, Tin={args.Tin}, H={args.horizon}; target coverage {cov})"
+        )
+        if min(counts["train"], counts["val"], counts["test"]) < 1:
+            raise RuntimeError(
+                "A split produced 0 windows; each segment must exceed Tin + H."
+            )
+        write_meta_only(cache_dir, args.date, meta)
+        return
+
+    seg_data = {
+        name: make_window_dataset(
+            X[lo:hi],
+            grid_embed,
+            edge_index,
+            Tin=args.Tin,
+            H=args.horizon,
+            observed_mask=observed_mask[lo:hi],
+            out_idx=out_idx,
+            edge_weight=edge_weight,
+            predict_delta=bool(args.predict_delta),
+            max_windows=args.max_windows,
+        )
+        for name, lo, hi in seg_bounds
+    }
+    train_data, val_data, test_data, pred_data = (
+        seg_data["train"],
+        seg_data["val"],
+        seg_data["test"],
+        seg_data["pred"],
+    )
+    print(
+        f"[split] slice-then-window train/val/test/pred = "
+        f"{len(train_data)}/{len(val_data)}/{len(test_data)}/{len(pred_data)}  "
+        f"(Tin={args.Tin}, H={args.horizon}; no window crosses a boundary)"
+    )
+    if min(len(train_data), len(val_data), len(test_data)) < 1:
+        raise RuntimeError(
+            "A split produced 0 windows; each segment length must exceed Tin + H. "
+            "Reduce --Tin/--horizon, change split fractions, or use a longer day."
+        )
+
     write_cache(
         cache_dir,
         args.date,
@@ -1000,10 +1065,36 @@ def train_stage(args, cache_dir: Path):
     log_name = args.log if args.log else f"fnet_temporal_{args.date}_{mpnn_label}"
     hydragnn.utils.print.print_utils.setup_log(log_name)
 
-    print(f"[cache] reading splits ({args.format}) from {cache_dir}")
-    trainset, valset, testset, predset, meta = read_cache(
-        cache_dir, args.date, args.format
-    )
+    if args.dataset_mode == "ondemand":
+        # Only the shared arrays were cached; rebuild the split datasets and let
+        # them construct each window in __getitem__. The windowing policy comes
+        # from the cache's meta, so train_stage cannot silently disagree with
+        # what --preonly recorded. A CLI --window_stride overrides it.
+        with open(_meta_path(cache_dir, args.date), "rb") as f:
+            meta = pickle.load(f)
+        stride = args.window_stride or meta.get("window_stride")
+        ds = splits_from_meta(
+            meta,
+            train_frac=meta.get("train_frac", args.train_frac),
+            val_frac=meta.get("val_frac", args.val_frac),
+            test_frac=meta.get("test_frac", args.test_frac),
+            pred_frac=meta.get("pred_frac", args.pred_frac),
+            max_windows=meta.get("max_windows") if stride is None else None,
+            stride=stride,
+        )
+        trainset, valset, testset, predset = (
+            ds["train"], ds["val"], ds["test"], ds["pred"],
+        )
+        cov = f"{100.0 * meta['horizon'] / stride:.1f}%" if stride else "n/a"
+        print(
+            f"[cache] on-demand windowing from {_meta_path(cache_dir, args.date)} "
+            f"(stride={stride}, target coverage {cov})"
+        )
+    else:
+        print(f"[cache] reading splits ({args.format}) from {cache_dir}")
+        trainset, valset, testset, predset, meta = read_cache(
+            cache_dir, args.date, args.format
+        )
     print(
         f"[cache] train/val/test/pred = "
         f"{len(trainset)}/{len(valset)}/{len(testset)}/{len(predset)}  "
@@ -1035,6 +1126,13 @@ def train_stage(args, cache_dir: Path):
     model = hydragnn.models.create_model_config(
         config=config["NeuralNetwork"], verbosity=verbosity
     )
+    # (every --seed produced byte-identical runs). Re-seed with args.seed and
+    # re-initialize every submodule that supports it, so --seed actually varies the
+    # initial weights and we can report a real mean +/- std across seeds.
+    torch.manual_seed(args.seed)
+    for module in model.modules():
+        if hasattr(module, "reset_parameters"):
+            module.reset_parameters()
     lr = config["NeuralNetwork"]["Training"]["Optimizer"]["learning_rate"]
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -1094,11 +1192,16 @@ def train_stage(args, cache_dir: Path):
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    np.save(out_dir / "tvec.npy", meta["tvec"])
-    np.save(out_dir / "X.npy", meta["X"])
-    np.save(out_dir / "A_hat.npy", meta["A_hat"])
-    np.save(out_dir / "A_geo.npy", meta["A_geo"])
-    np.save(out_dir / "grid_embed.npy", meta["grid_embed"])
+    # Downstream-detector inputs. These are identical for every run of a given
+    # cache (X alone is ~1.4 GB for a full day), so writing them per-run wastes
+    # disk fast during a sweep. --skip_downstream_arrays omits them; the
+    # comparison/report only needs preds/ys/masks + feat_mean/std + out_idx.
+    if not args.skip_downstream_arrays:
+        np.save(out_dir / "tvec.npy", meta["tvec"])
+        np.save(out_dir / "X.npy", meta["X"])
+        np.save(out_dir / "A_hat.npy", meta["A_hat"])
+        np.save(out_dir / "A_geo.npy", meta["A_geo"])
+        np.save(out_dir / "grid_embed.npy", meta["grid_embed"])
     np.save(out_dir / "preds_val.npy", preds_val)
     np.save(out_dir / "ys_val.npy", ys_val)
     np.save(out_dir / "preds_test.npy", preds_test)
@@ -1394,6 +1497,32 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Cap total windows (evenly spaced subset). Useful for fast iteration.",
     )
+    p.add_argument(
+        "--skip_downstream_arrays",
+        action="store_true",
+        help="Do not save the per-run downstream-detector arrays (X, tvec, A_hat, "
+        "A_geo, grid_embed). X alone is ~1.4 GB/run; skip it during sweeps. "
+        "preds/ys/masks, feat_mean/std and out_idx are still written.",
+    )
+    p.add_argument(
+        "--dataset_mode",
+        type=str,
+        default="materialized",
+        choices=["materialized", "ondemand"],
+        help="'materialized' pickles one PyG Data per window (~0.39 MB each, so the "
+        "cache scales with window count: ~26 GB at stride 10). 'ondemand' caches only "
+        "the shared [T,N,F] arrays (~1.6 GB) and builds each window in __getitem__, "
+        "making disk/RAM independent of the window count (and ~1.4x faster to read).",
+    )
+    p.add_argument(
+        "--window_stride",
+        type=int,
+        default=None,
+        help="Take every Nth window anchor (requires --dataset_mode ondemand). "
+        "Setting it to --horizon makes the forecast horizons tile the timeline "
+        "exactly (100%% target coverage) and matches the standalone T-GCN's "
+        "sampling scheme. Overrides --max_windows.",
+    )
     # Split (4-way, time-ordered; each segment is windowed independently)
     p.add_argument("--train_frac", type=float, default=0.8)
     p.add_argument("--val_frac", type=float, default=0.05)
@@ -1472,6 +1601,11 @@ def main():
 
     if args.preonly and args.do_all:
         raise SystemExit("--preonly and --do_all are mutually exclusive.")
+    if args.window_stride is not None and args.dataset_mode != "ondemand":
+        raise SystemExit(
+            "--window_stride requires --dataset_mode ondemand "
+            "(the materialized cache fixes its windows at --preonly time)."
+        )
 
     if args.preonly or args.do_all:
         if args.data_root is None:
