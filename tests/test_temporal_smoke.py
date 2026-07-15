@@ -198,7 +198,7 @@ def pytest_temporalgcn_forward_runs(temporal_mode, temporal_batch_norm):
     )
 
     model.eval()
-    batch = next(iter(loader))
+    batch = next(iter(loader)).to(hydragnn.utils.distributed.get_device())
     with torch.no_grad():
         out = model(batch)
 
@@ -229,8 +229,9 @@ def pytest_edge_weight_changes_output():
     model.eval()
 
     ds_unweighted = _make_dataset(edge_index, edge_weight=None)  # same X + graph
-    batch_w = Batch.from_data_list([ds_weighted[0]])
-    batch_u = Batch.from_data_list([ds_unweighted[0]])
+    device = hydragnn.utils.distributed.get_device()
+    batch_w = Batch.from_data_list([ds_weighted[0]]).to(device)
+    batch_u = Batch.from_data_list([ds_unweighted[0]]).to(device)
 
     with torch.no_grad():
         out_w = model(batch_w)[0]
@@ -258,7 +259,7 @@ def pytest_batch_norm_flag_changes_training_output():
     model, loader = _build_model(
         _base_config("post_gcn", temporal_batch_norm=True), dataset
     )
-    batch = next(iter(loader))
+    batch = next(iter(loader)).to(hydragnn.utils.distributed.get_device())
 
     model.train()
     with torch.no_grad():
