@@ -1122,6 +1122,23 @@ def train_stage(args, cache_dir: Path):
     config = hydragnn.utils.input_config_parsing.update_config(
         config, train_loader, val_loader, test_loader
     )
+    if mpnn_label == "TemporalPNA":
+        # update_config()'s PNA_models list only covers the non-temporal
+        # PNA/PNAPlus/PNAEq, so it leaves pna_deg=None here (create.py then
+        # asserts). The sensor graph is identical for every window, so the
+        # degree histogram only needs to be computed once from meta["edge_index"]
+        # -- not by iterating the dataset (that's for datasets with a different
+        # graph per sample, which this isn't).
+        from torch_geometric.utils import degree as _pyg_degree
+
+        d = _pyg_degree(
+            meta["edge_index"][1], num_nodes=len(meta["sites"]), dtype=torch.long
+        )
+        pna_deg = torch.bincount(d)
+        config["NeuralNetwork"]["Architecture"]["pna_deg"] = pna_deg.tolist()
+        config["NeuralNetwork"]["Architecture"]["max_neighbours"] = (
+            len(pna_deg) - 1
+        )
 
     model = hydragnn.models.create_model_config(
         config=config["NeuralNetwork"], verbosity=verbosity

@@ -105,7 +105,7 @@ SEEDS = [42, 1, 2]
 # VRAM at batch 32. Add it explicitly (and lower --batch_size) if you have the
 # memory -- but note a differing batch size breaks parity.
 BACKBONES = ["TemporalGCN", "TemporalGIN", "TemporalSAGE"]
-BACKBONES_ALL = BACKBONES + ["TemporalGAT"]
+BACKBONES_ALL = BACKBONES + ["TemporalGAT", "TemporalPNA"]
 
 # The standalone only writes prediction arrays for these splits, so these are the
 # only splits whose metrics we can recompute independently for BOTH sides.
